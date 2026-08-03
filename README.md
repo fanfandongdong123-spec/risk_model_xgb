@@ -69,10 +69,15 @@ result = pipeline.run()
 xgb_mod = result.model
 top_var_list = result.selected_vars
 imp_df = result.importance_df
+ks_dev = result.ks_dev
+ks_val = result.ks_val
+sql = result.sql
+lost_vars = result.lost_vars
 
-print("Dev KS:", result.ks_dev)
-print("Val KS:", result.ks_val)
+print("Dev KS:", ks_dev)
+print("Val KS:", ks_val)
 print("Top变量数:", len(top_var_list))
+print("未找到的变量:", lost_vars)
 
 display(imp_df.head(20))
 ```
