@@ -8,9 +8,9 @@ class PipelineConfig:
     sample_table: str
     feature_table_list: list[str]
 
-    presto_user: str = ""
+    presto_user: str = "denghf10"
     presto_password: str | None = None
-    presto_host: str = "your-presto-host"
+    presto_host: str = "elacpresto.akulaku.com"
     presto_port: int = 8443
     presto_catalog: str = "hive"
 

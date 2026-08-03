@@ -8,8 +8,8 @@ config = PipelineConfig(
         "hive_store.risk_model.your_feature_table_2",
         "hive_store.risk_model.your_feature_table_3",
     ],
-    presto_user="your_user",
-    presto_host="your-presto-host",
+    presto_user="denghf10",
+    presto_host="elacpresto.akulaku.com",
     join_key_sample="po_id",
     join_key_feature="main_iou_id",
     target_col="fpd15",
@@ -18,6 +18,21 @@ config = PipelineConfig(
     miss_threshold=0.95,
     single_value_threshold=0.95,
     num_boost_round=800,
+    xgb_params={
+        "booster": "gbtree",
+        "objective": "binary:logistic",
+        "learning_rate": 0.03,
+        "disable_default_eval_metric": 1,
+        "validate_parameters": True,
+        "gamma": 1,
+        "max_depth": 3,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "tree_method": "hist",
+        "max_bin": 6,
+        "min_child_weight": 100,
+        "seed": 12345,
+    },
 )
 
 pipeline = RiskModelPipeline(config)
