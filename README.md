@@ -66,9 +66,15 @@ config = PipelineConfig(
 pipeline = RiskModelPipeline(config)
 result = pipeline.run()
 
+xgb_mod = result.model
+top_var_list = result.selected_vars
+imp_df = result.importance_df
+
 print("Dev KS:", result.ks_dev)
 print("Val KS:", result.ks_val)
-print("Selected vars:", result.selected_vars)
+print("Top变量数:", len(top_var_list))
+
+display(imp_df.head(20))
 ```
 
 只使用指定变量：
