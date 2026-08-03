@@ -148,8 +148,21 @@ class RiskModelPipeline:
             print(f"检测到 {self.config.seg_col} 字段，使用原始分组")
             return df
 
-        rng = np.random.RandomState(self.config.random_seed)
-        df[self.config.seg_col] = np.where(rng.rand(len(df)) < 0.7, self.config.dev_value, self.config.val_value)
+        person_col = self.config.person_uuid_col
+        if person_col not in df.columns:
+            raise KeyError(f"缺少按人划分所需字段: {person_col}")
+
+        dev_persons = (
+            df[person_col]
+            .drop_duplicates()
+            .sample(frac=0.7, random_state=self.config.random_seed)
+        )
+        df[self.config.seg_col] = np.where(
+            df[person_col].isin(dev_persons),
+            self.config.dev_value,
+            self.config.val_value,
+        )
+        print(f"按 {person_col} 划分 dev/val，同一人的所有订单保持在同一分组")
         return df
 
     def _reduce_memory(self, df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:

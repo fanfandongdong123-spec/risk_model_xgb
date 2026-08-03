@@ -55,7 +55,7 @@ def build_join_sql(config: PipelineConfig, table_vars: dict[str, list[str]]) -> 
         alias = f"f{i}"
         select_cols.extend([f"{alias}.{var}" for var in vars_])
         join_sql.append(
-            f"left join {table} {alias} "
+            f"join {table} {alias} "
             f"on s.{config.join_key_sample} = {alias}.{config.join_key_feature}"
         )
 
