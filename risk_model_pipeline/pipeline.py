@@ -71,12 +71,20 @@ class RiskModelPipeline:
         gc.collect()
         return df, sql, lost_vars, var_candidate
 
-    def run(self, var_lst: list[str] | None = None) -> PipelineResult:
-        if var_lst is None:
-            var_lst = self.get_all_features()
-            print(f"汇总全部 {self.config.feature_prefix} 特征数: {len(var_lst)}")
+    def run(
+        self,
+        var_lst: list[str] | None = None,
+        df: pd.DataFrame | None = None,
+    ) -> PipelineResult:
+        if df is None:
+            if var_lst is None:
+                var_lst = self.get_all_features()
+                print(f"汇总全部 {self.config.feature_prefix} 特征数: {len(var_lst)}")
 
-        df, sql, lost_vars, var_candidate = self.load_dataset(var_lst)
+            df, sql, lost_vars, var_candidate = self.load_dataset(var_lst)
+        else:
+            df, lost_vars, var_candidate = self._prepare_input_dataframe(df, var_lst)
+            sql = ""
 
         var_after_miss = self.filter_by_missing(df, var_candidate)
         var_after_single = self.filter_by_single_value(df, var_after_miss)
@@ -142,6 +150,40 @@ class RiskModelPipeline:
             sql=sql,
             lost_vars=lost_vars,
         )
+
+    def _prepare_input_dataframe(
+        self,
+        df: pd.DataFrame,
+        var_lst: list[str] | None,
+    ) -> tuple[pd.DataFrame, list[str], list[str]]:
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas DataFrame")
+        if df.empty:
+            raise ValueError("输入的 df 不能为空")
+        if self.config.target_col not in df.columns:
+            raise KeyError(f"输入 df 缺少目标字段: {self.config.target_col}")
+
+        df = df.copy()
+        if var_lst is None:
+            var_candidate = sorted(
+                col for col in df.columns if col.startswith(self.config.feature_prefix)
+            )
+            lost_vars = []
+            print(f"从输入 df 汇总全部 {self.config.feature_prefix} 特征数: {len(var_candidate)}")
+        else:
+            var_candidate = list(dict.fromkeys(var for var in var_lst if var in df.columns))
+            lost_vars = list(dict.fromkeys(var for var in var_lst if var not in df.columns))
+            if lost_vars:
+                print(f"警告: {len(lost_vars)} 个变量不在输入 df 中，已丢弃，示例: {lost_vars[:20]}")
+
+        if not var_candidate:
+            raise ValueError("输入 df 中没有可用于训练的特征")
+
+        df = self._auto_split_seg(df)
+        df = self._reduce_memory(df, var_candidate)
+        gc.collect()
+        print(f"使用手动输入 DataFrame 训练: shape={df.shape}")
+        return df, lost_vars, var_candidate
 
     def _auto_split_seg(self, df: pd.DataFrame) -> pd.DataFrame:
         if self.config.seg_col in df.columns:

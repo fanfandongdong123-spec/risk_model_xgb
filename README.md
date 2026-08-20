@@ -89,6 +89,21 @@ var_lst = ["mf_xxx_1", "mf_xxx_2"]
 result = pipeline.run(var_lst)
 ```
 
+直接使用已有的 pandas DataFrame 训练，不连接或下载 Presto 数据：
+
+```python
+# 自动使用 df_input 中所有以 feature_prefix（默认 mf_）开头的字段
+result = pipeline.run(df=df_input)
+
+# 或明确指定入模候选变量
+result = pipeline.run(
+    var_lst=["mf_xxx_1", "mf_xxx_2"],
+    df=df_input,
+)
+```
+
+输入的 DataFrame 至少需要包含目标字段（默认 `fpd15`）和特征字段。如果没有 `seg_v`，还需包含 `person_uuid`，pipeline 会保证同一个人的全部订单处于同一个 Dev/Val 分组。传入的 DataFrame 会先复制，原始对象不会被修改。此方式返回的 `result.sql` 是空字符串。
+
 ## 数据拼接和样本划分
 
 样本表字段 `po_id` 默认与特征表字段 `main_iou_id` 通过普通 `JOIN` 关联，因此只有成功匹配特征表的样本会保留。

@@ -44,6 +44,10 @@ result = pipeline.run()
 # var_lst = ["mf_xxx_1", "mf_xxx_2"]
 # result = pipeline.run(var_lst)
 
+# Option 3: train directly from an existing pandas DataFrame (skip Presto)
+# result = pipeline.run(df=df_input)
+# result = pipeline.run(var_lst=["mf_xxx_1", "mf_xxx_2"], df=df_input)
+
 xgb_model = result.model
 selected_vars = result.selected_vars
 importance_df = result.importance_df
