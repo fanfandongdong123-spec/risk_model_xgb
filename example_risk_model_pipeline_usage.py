@@ -48,6 +48,10 @@ result = pipeline.run()
 # result = pipeline.run(df=df_input)
 # result = pipeline.run(var_lst=["mf_xxx_1", "mf_xxx_2"], df=df_input)
 
+# Option 4: optionally return all sample-table columns + final model features
+# result = pipeline.run(df=df_input, return_data=True)
+# model_data = result.data
+
 xgb_model = result.model
 selected_vars = result.selected_vars
 importance_df = result.importance_df

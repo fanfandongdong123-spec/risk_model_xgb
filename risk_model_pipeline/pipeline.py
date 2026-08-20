@@ -9,7 +9,7 @@ from titan.common.data_download import hdfs_to_local
 
 from .config import PipelineConfig
 from .metrics import calc_ks
-from .sql import build_feature_table_mapping, build_join_sql, group_vars_by_table
+from .sql import build_feature_table_mapping, build_join_sql, get_table_columns, group_vars_by_table
 
 
 @dataclass
@@ -21,6 +21,7 @@ class PipelineResult:
     ks_val: float
     sql: str
     lost_vars: list[str]
+    data: pd.DataFrame | None = None
 
 
 class RiskModelPipeline:
@@ -28,12 +29,18 @@ class RiskModelPipeline:
         self.config = config
         self.feat2table: dict[str, str] | None = None
         self.table_cols: dict[str, list[str]] | None = None
+        self.sample_cols: list[str] | None = None
 
     def _create_engine(self):
         return create_engine(self.config.presto_url(), connect_args={"protocol": "https"})
 
     def load_table_metadata(self, refresh: bool = False):
-        if self.feat2table is not None and self.table_cols is not None and not refresh:
+        if (
+            self.feat2table is not None
+            and self.table_cols is not None
+            and self.sample_cols is not None
+            and not refresh
+        ):
             return self.feat2table, self.table_cols
 
         engine = self._create_engine()
@@ -42,6 +49,7 @@ class RiskModelPipeline:
                 self.config.feature_table_list,
                 engine,
             )
+            self.sample_cols = get_table_columns(self.config.sample_table, engine)
         finally:
             engine.dispose()
 
@@ -52,14 +60,22 @@ class RiskModelPipeline:
         prefix = self.config.feature_prefix if prefix is None else prefix
         return sorted({c for cols in table_cols.values() for c in cols if c.startswith(prefix)})
 
-    def build_sql(self, var_lst: list[str]) -> tuple[str, list[str], dict[str, list[str]]]:
+    def build_sql(
+        self,
+        var_lst: list[str],
+        include_all_sample_cols: bool = False,
+    ) -> tuple[str, list[str], dict[str, list[str]]]:
         feat2table, _ = self.load_table_metadata()
         table_vars, lost_vars = group_vars_by_table(var_lst, feat2table)
-        sql = build_join_sql(self.config, table_vars)
+        sql = build_join_sql(self.config, table_vars, include_all_sample_cols)
         return sql, lost_vars, table_vars
 
-    def load_dataset(self, var_lst: list[str]) -> tuple[pd.DataFrame, str, list[str], list[str]]:
-        sql, lost_vars, table_vars = self.build_sql(var_lst)
+    def load_dataset(
+        self,
+        var_lst: list[str],
+        include_all_sample_cols: bool = False,
+    ) -> tuple[pd.DataFrame, str, list[str], list[str]]:
+        sql, lost_vars, table_vars = self.build_sql(var_lst, include_all_sample_cols)
 
         print("开始拉取样本+特征宽表...")
         df = hdfs_to_local(sql=sql)
@@ -75,13 +91,17 @@ class RiskModelPipeline:
         self,
         var_lst: list[str] | None = None,
         df: pd.DataFrame | None = None,
+        return_data: bool = False,
     ) -> PipelineResult:
         if df is None:
             if var_lst is None:
                 var_lst = self.get_all_features()
                 print(f"汇总全部 {self.config.feature_prefix} 特征数: {len(var_lst)}")
 
-            df, sql, lost_vars, var_candidate = self.load_dataset(var_lst)
+            df, sql, lost_vars, var_candidate = self.load_dataset(
+                var_lst,
+                include_all_sample_cols=return_data,
+            )
         else:
             df, lost_vars, var_candidate = self._prepare_input_dataframe(df, var_lst)
             sql = ""
@@ -141,6 +161,22 @@ class RiskModelPipeline:
         print(f"Dev KS: {ks_dev:.4f}")
         print(f"Val KS: {ks_val:.4f}")
 
+        result_data = None
+        if return_data:
+            sample_cols = (
+                self.sample_cols
+                if sql and self.sample_cols is not None
+                else [col for col in df.columns if col not in var_candidate]
+            )
+            model_features = model.feature_names or selected_vars
+            output_cols = list(
+                dict.fromkeys(
+                    [col for col in sample_cols if col in df.columns]
+                    + [col for col in model_features if col in df.columns]
+                )
+            )
+            result_data = df.loc[:, output_cols].copy()
+
         return PipelineResult(
             model=model,
             selected_vars=selected_vars,
@@ -149,6 +185,7 @@ class RiskModelPipeline:
             ks_val=ks_val,
             sql=sql,
             lost_vars=lost_vars,
+            data=result_data,
         )
 
     def _prepare_input_dataframe(

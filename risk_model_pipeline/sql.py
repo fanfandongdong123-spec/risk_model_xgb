@@ -42,13 +42,21 @@ def group_vars_by_table(var_lst: list[str], feat2table: dict) -> tuple[dict[str,
     return table_vars, lost_vars
 
 
-def build_join_sql(config: PipelineConfig, table_vars: dict[str, list[str]]) -> str:
-    select_cols = [
-        f"s.{config.join_key_sample}",
-        f"s.{config.person_uuid_col}",
-        f"s.{config.target_col}",
-        f"s.{config.seg_col}",
-    ]
+def build_join_sql(
+    config: PipelineConfig,
+    table_vars: dict[str, list[str]],
+    include_all_sample_cols: bool = False,
+) -> str:
+    select_cols = (
+        ["s.*"]
+        if include_all_sample_cols
+        else [
+            f"s.{config.join_key_sample}",
+            f"s.{config.person_uuid_col}",
+            f"s.{config.target_col}",
+            f"s.{config.seg_col}",
+        ]
+    )
     join_sql = []
 
     for i, (table, vars_) in enumerate(table_vars.items()):

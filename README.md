@@ -82,6 +82,20 @@ print("未找到的变量:", lost_vars)
 display(imp_df.head(20))
 ```
 
+如需同时返回建模后的数据，设置 `return_data=True`：
+
+```python
+result = pipeline.run(return_data=True)
+model_data = result.data
+```
+
+`model_data` 包含样本表的全部字段以及最终模型的 `result.model.feature_names`。Presto 模式会读取样本表结构并保留全部样本字段；手动 DataFrame 模式会把未列入候选特征的字段视为样本字段。默认 `return_data=False`，此时 `result.data` 为 `None`，可减少内存占用。手动输入 DataFrame 时同样适用：
+
+```python
+result = pipeline.run(df=df_input, return_data=True)
+model_data = result.data
+```
+
 只使用指定变量：
 
 ```python
