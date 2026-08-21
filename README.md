@@ -134,11 +134,11 @@ train_df = split_result.train
 val_df = split_result.val
 ```
 
-使用已经带有 `seg_v` 的 DataFrame 单独训练模型：
+单独训练模型。如果输入 DataFrame 没有 `seg_v`，默认会自动按照 `person_uuid` 划分，并通过 `train_result.data` 返回带有 `seg_v` 的数据：
 
 ```python
 train_result = pipeline.train_model(
-    df=df_with_seg,
+    df=df_input,
     feature_names=var_in,
     target_col="delq_d30_cnt",
     weight_col="weight",
@@ -146,13 +146,19 @@ train_result = pipeline.train_model(
     num_boost_round=2000,
     early_stopping_rounds=70,
     verbose_eval=50,
+    auto_split=True,
+    train_frac=0.7,
+    random_state=42,
 )
 
+df_with_seg = train_result.data
 xgb_mod = train_result.model
 ks_dev = train_result.ks_dev
 ks_val = train_result.ks_val
 evals_result = train_result.evals_result
 ```
+
+传入的数据已经包含 `seg_v` 时会直接使用现有分组；缺少时，`auto_split=True` 会自动划分。原始 DataFrame 不会被修改，带分组字段的数据从 `train_result.data` 获取。设置 `auto_split=False` 可以在缺少 `seg_v` 时直接报错。
 
 `weight_col` 只应用于 Dev 训练集，与 `xgb.DMatrix(..., weight=sample_weight)` 等价；验证集不加权。传入 `None` 表示不使用样本权重。独立训练使用 KS 作为自定义评估指标，并按验证集 KS 执行早停。
 

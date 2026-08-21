@@ -38,6 +38,7 @@ class ModelTrainingResult:
     ks_val: float
     evals_result: dict
     feature_names: list[str]
+    data: pd.DataFrame
 
 
 class RiskModelPipeline:
@@ -259,18 +260,34 @@ class RiskModelPipeline:
         num_boost_round: int | None = None,
         early_stopping_rounds: int | None = 70,
         verbose_eval: int | bool | None = 50,
+        auto_split: bool = True,
+        train_frac: float = 0.7,
+        random_state: int | None = None,
     ) -> ModelTrainingResult:
-        """使用已有 seg 字段单独训练 XGBoost，支持训练集样本权重和 KS 早停。"""
+        """单独训练 XGBoost；缺少 seg 字段时可按 person_uuid 自动划分。"""
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df 必须是 pandas DataFrame")
         if df.empty:
             raise ValueError("输入的 df 不能为空")
 
+        if self.config.seg_col not in df.columns:
+            if not auto_split:
+                raise KeyError(
+                    f"输入 df 缺少分组字段: {self.config.seg_col}; "
+                    "请先调用 split_dataset，或设置 auto_split=True"
+                )
+            print(f"未检测到 {self.config.seg_col}，自动按用户划分 Dev/Val")
+            df = self.split_dataset(
+                df,
+                train_frac=train_frac,
+                random_state=random_state,
+            ).data
+        else:
+            df = df.copy()
+
         target_col = self.config.target_col if target_col is None else target_col
-        required_cols = [self.config.seg_col, target_col]
-        missing_required = [col for col in required_cols if col not in df.columns]
-        if missing_required:
-            raise KeyError(f"输入 df 缺少字段: {missing_required}")
+        if target_col not in df.columns:
+            raise KeyError(f"输入 df 缺少目标字段: {target_col}")
 
         feature_names = list(dict.fromkeys(feature_names))
         missing_features = [col for col in feature_names if col not in df.columns]
@@ -334,6 +351,7 @@ class RiskModelPipeline:
             ks_val=ks_val,
             evals_result=evals_result,
             feature_names=feature_names,
+            data=df,
         )
 
     def _get_train_weight(

@@ -52,7 +52,20 @@ result = pipeline.run()
 # result = pipeline.run(df=df_input, return_data=True)
 # model_data = result.data
 
-# Option 5: split by person_uuid and train a model separately
+# Option 5: train separately; missing seg_v is split automatically by person_uuid
+# train_result = pipeline.train_model(
+#     df=df_input,
+#     feature_names=["mf_xxx_1", "mf_xxx_2"],
+#     target_col="delq_d30_cnt",
+#     weight_col="weight",
+#     num_boost_round=2000,
+#     early_stopping_rounds=70,
+#     train_frac=0.7,
+#     random_state=42,
+# )
+# df_with_seg = train_result.data
+#
+# Or split explicitly before training
 # split_result = pipeline.split_dataset(df_input, train_frac=0.7, random_state=42)
 # df_with_seg = split_result.data
 # train_df = split_result.train
