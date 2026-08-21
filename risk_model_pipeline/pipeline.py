@@ -24,6 +24,22 @@ class PipelineResult:
     data: pd.DataFrame | None = None
 
 
+@dataclass
+class DatasetSplit:
+    data: pd.DataFrame
+    train: pd.DataFrame
+    val: pd.DataFrame
+
+
+@dataclass
+class ModelTrainingResult:
+    model: xgb.Booster
+    ks_dev: float
+    ks_val: float
+    evals_result: dict
+    feature_names: list[str]
+
+
 class RiskModelPipeline:
     def __init__(self, config: PipelineConfig):
         self.config = config
@@ -92,6 +108,7 @@ class RiskModelPipeline:
         var_lst: list[str] | None = None,
         df: pd.DataFrame | None = None,
         return_data: bool = False,
+        weight_col: str | None = None,
     ) -> PipelineResult:
         if df is None:
             if var_lst is None:
@@ -100,7 +117,7 @@ class RiskModelPipeline:
 
             df, sql, lost_vars, var_candidate = self.load_dataset(
                 var_lst,
-                include_all_sample_cols=return_data,
+                include_all_sample_cols=return_data or weight_col is not None,
             )
         else:
             df, lost_vars, var_candidate = self._prepare_input_dataframe(df, var_lst)
@@ -114,11 +131,13 @@ class RiskModelPipeline:
 
         y_dev = df.loc[dev_mask, self.config.target_col].to_numpy()
         y_val = df.loc[val_mask, self.config.target_col].to_numpy()
+        train_weight = self._get_train_weight(df, dev_mask, weight_col)
 
         print("开始初筛模型训练...")
         dtrain_tmp = xgb.DMatrix(
             df.loc[dev_mask, var_after_single],
             label=y_dev,
+            weight=train_weight,
             feature_names=var_after_single,
         )
         model_tmp = xgb.train(
@@ -136,6 +155,7 @@ class RiskModelPipeline:
         dtrain = xgb.DMatrix(
             df.loc[dev_mask, selected_vars],
             label=y_dev,
+            weight=train_weight,
             feature_names=selected_vars,
         )
         dval = xgb.DMatrix(
@@ -188,6 +208,161 @@ class RiskModelPipeline:
             data=result_data,
         )
 
+    def split_dataset(
+        self,
+        df: pd.DataFrame,
+        train_frac: float = 0.7,
+        random_state: int | None = None,
+    ) -> DatasetSplit:
+        """按 person_uuid 划分 Dev/Val，同一人的全部订单保持在同一组。"""
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas DataFrame")
+        if df.empty:
+            raise ValueError("输入的 df 不能为空")
+        if not 0 < train_frac < 1:
+            raise ValueError("train_frac 必须在 0 和 1 之间")
+
+        person_col = self.config.person_uuid_col
+        if person_col not in df.columns:
+            raise KeyError(f"缺少按人划分所需字段: {person_col}")
+
+        random_state = self.config.random_seed if random_state is None else random_state
+        data = df.copy()
+        dev_persons = (
+            data[person_col]
+            .drop_duplicates()
+            .sample(frac=train_frac, random_state=random_state)
+        )
+        data[self.config.seg_col] = np.where(
+            data[person_col].isin(dev_persons),
+            self.config.dev_value,
+            self.config.val_value,
+        )
+        train = data.loc[data[self.config.seg_col].eq(self.config.dev_value)].copy()
+        val = data.loc[data[self.config.seg_col].eq(self.config.val_value)].copy()
+        if train.empty or val.empty:
+            raise ValueError("划分后 Dev 或 Val 为空，请增加用户数或调整 train_frac")
+
+        print(
+            f"按 {person_col} 划分完成: "
+            f"Dev={len(train)}, Val={len(val)}, train_frac={train_frac}"
+        )
+        return DatasetSplit(data=data, train=train, val=val)
+
+    def train_model(
+        self,
+        df: pd.DataFrame,
+        feature_names: list[str],
+        target_col: str | None = None,
+        weight_col: str | None = None,
+        params: dict | None = None,
+        num_boost_round: int | None = None,
+        early_stopping_rounds: int | None = 70,
+        verbose_eval: int | bool | None = 50,
+    ) -> ModelTrainingResult:
+        """使用已有 seg 字段单独训练 XGBoost，支持训练集样本权重和 KS 早停。"""
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas DataFrame")
+        if df.empty:
+            raise ValueError("输入的 df 不能为空")
+
+        target_col = self.config.target_col if target_col is None else target_col
+        required_cols = [self.config.seg_col, target_col]
+        missing_required = [col for col in required_cols if col not in df.columns]
+        if missing_required:
+            raise KeyError(f"输入 df 缺少字段: {missing_required}")
+
+        feature_names = list(dict.fromkeys(feature_names))
+        missing_features = [col for col in feature_names if col not in df.columns]
+        if missing_features:
+            raise KeyError(f"输入 df 缺少特征，示例: {missing_features[:20]}")
+        if not feature_names:
+            raise ValueError("feature_names 不能为空")
+
+        dev_mask = df[self.config.seg_col].eq(self.config.dev_value).to_numpy()
+        val_mask = df[self.config.seg_col].eq(self.config.val_value).to_numpy()
+        if not dev_mask.any() or not val_mask.any():
+            raise ValueError(
+                f"{self.config.seg_col} 必须同时包含 "
+                f"{self.config.dev_value!r} 和 {self.config.val_value!r}"
+            )
+
+        y_dev = df.loc[dev_mask, target_col].to_numpy()
+        y_val = df.loc[val_mask, target_col].to_numpy()
+        train_weight = self._get_train_weight(df, dev_mask, weight_col)
+
+        dtrain = xgb.DMatrix(
+            df.loc[dev_mask, feature_names],
+            label=y_dev,
+            weight=train_weight,
+            feature_names=feature_names,
+        )
+        dval = xgb.DMatrix(
+            df.loc[val_mask, feature_names],
+            label=y_val,
+            feature_names=feature_names,
+        )
+
+        train_params = dict(self.config.xgb_params if params is None else params)
+        rounds = self.config.num_boost_round if num_boost_round is None else num_boost_round
+        verbose = self.config.verbose_eval if verbose_eval is None else verbose_eval
+        evals_result = {}
+        model = xgb.train(
+            train_params,
+            dtrain,
+            num_boost_round=rounds,
+            evals=[(dtrain, "dev"), (dval, "val")],
+            feval=self._xgb_eval_ks,
+            maximize=True,
+            verbose_eval=verbose,
+            early_stopping_rounds=early_stopping_rounds,
+            evals_result=evals_result,
+        )
+
+        ks_dev = calc_ks(y_dev, model.predict(dtrain))
+        ks_val = calc_ks(y_val, model.predict(dval))
+        print("\n==== 单独训练结果 ====")
+        print(f"Dev KS: {ks_dev:.4f}")
+        print(f"Val KS: {ks_val:.4f}")
+        if hasattr(model, "best_iteration"):
+            print(f"Best iteration: {model.best_iteration + 1}")
+
+        gc.collect()
+        return ModelTrainingResult(
+            model=model,
+            ks_dev=ks_dev,
+            ks_val=ks_val,
+            evals_result=evals_result,
+            feature_names=feature_names,
+        )
+
+    def _get_train_weight(
+        self,
+        df: pd.DataFrame,
+        dev_mask: np.ndarray,
+        weight_col: str | None,
+    ) -> np.ndarray | None:
+        if weight_col is None:
+            return None
+        if weight_col not in df.columns:
+            raise KeyError(f"输入 df 缺少样本权重字段: {weight_col}")
+
+        weights = pd.to_numeric(
+            df.loc[dev_mask, weight_col],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        if not np.isfinite(weights).all():
+            raise ValueError(f"样本权重字段 {weight_col} 包含空值或非数值")
+        if (weights < 0).any():
+            raise ValueError(f"样本权重字段 {weight_col} 不能包含负数")
+        if weights.sum() <= 0:
+            raise ValueError(f"样本权重字段 {weight_col} 的训练集权重和必须大于 0")
+        return weights
+
+    @staticmethod
+    def _xgb_eval_ks(preds: np.ndarray, dmatrix: xgb.DMatrix) -> tuple[str, float]:
+        return "ks", calc_ks(dmatrix.get_label(), preds)
+
     def _prepare_input_dataframe(
         self,
         df: pd.DataFrame,
@@ -227,22 +402,7 @@ class RiskModelPipeline:
             print(f"检测到 {self.config.seg_col} 字段，使用原始分组")
             return df
 
-        person_col = self.config.person_uuid_col
-        if person_col not in df.columns:
-            raise KeyError(f"缺少按人划分所需字段: {person_col}")
-
-        dev_persons = (
-            df[person_col]
-            .drop_duplicates()
-            .sample(frac=0.7, random_state=self.config.random_seed)
-        )
-        df[self.config.seg_col] = np.where(
-            df[person_col].isin(dev_persons),
-            self.config.dev_value,
-            self.config.val_value,
-        )
-        print(f"按 {person_col} 划分 dev/val，同一人的所有订单保持在同一分组")
-        return df
+        return self.split_dataset(df).data
 
     def _reduce_memory(self, df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
         for col in feature_cols:

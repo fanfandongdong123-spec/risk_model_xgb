@@ -118,6 +118,53 @@ result = pipeline.run(
 
 输入的 DataFrame 至少需要包含目标字段（默认 `fpd15`）和特征字段。如果没有 `seg_v`，还需包含 `person_uuid`，pipeline 会保证同一个人的全部订单处于同一个 Dev/Val 分组。传入的 DataFrame 会先复制，原始对象不会被修改。此方式返回的 `result.sql` 是空字符串。
 
+## 单独划分数据和训练模型
+
+按照 `person_uuid` 单独划分数据。同一用户的全部 `po_id` 会进入同一个分组：
+
+```python
+split_result = pipeline.split_dataset(
+    df_input,
+    train_frac=0.7,
+    random_state=42,
+)
+
+df_with_seg = split_result.data
+train_df = split_result.train
+val_df = split_result.val
+```
+
+使用已经带有 `seg_v` 的 DataFrame 单独训练模型：
+
+```python
+train_result = pipeline.train_model(
+    df=df_with_seg,
+    feature_names=var_in,
+    target_col="delq_d30_cnt",
+    weight_col="weight",
+    params=config.xgb_params,
+    num_boost_round=2000,
+    early_stopping_rounds=70,
+    verbose_eval=50,
+)
+
+xgb_mod = train_result.model
+ks_dev = train_result.ks_dev
+ks_val = train_result.ks_val
+evals_result = train_result.evals_result
+```
+
+`weight_col` 只应用于 Dev 训练集，与 `xgb.DMatrix(..., weight=sample_weight)` 等价；验证集不加权。传入 `None` 表示不使用样本权重。独立训练使用 KS 作为自定义评估指标，并按验证集 KS 执行早停。
+
+完整 pipeline 同样支持权重：
+
+```python
+result = pipeline.run(
+    df=df_input,
+    weight_col="weight",
+)
+```
+
 ## 数据拼接和样本划分
 
 样本表字段 `po_id` 默认与特征表字段 `main_iou_id` 通过普通 `JOIN` 关联，因此只有成功匹配特征表的样本会保留。

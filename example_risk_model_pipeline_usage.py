@@ -52,6 +52,27 @@ result = pipeline.run()
 # result = pipeline.run(df=df_input, return_data=True)
 # model_data = result.data
 
+# Option 5: split by person_uuid and train a model separately
+# split_result = pipeline.split_dataset(df_input, train_frac=0.7, random_state=42)
+# df_with_seg = split_result.data
+# train_df = split_result.train
+# val_df = split_result.val
+#
+# train_result = pipeline.train_model(
+#     df=df_with_seg,
+#     feature_names=["mf_xxx_1", "mf_xxx_2"],
+#     target_col="delq_d30_cnt",
+#     weight_col="weight",  # only applied to the Dev training set
+#     params=config.xgb_params,
+#     num_boost_round=2000,
+#     early_stopping_rounds=70,
+#     verbose_eval=50,
+# )
+# xgb_model = train_result.model
+# train_ks = train_result.ks_dev
+# val_ks = train_result.ks_val
+# evals_result = train_result.evals_result
+
 xgb_model = result.model
 selected_vars = result.selected_vars
 importance_df = result.importance_df
