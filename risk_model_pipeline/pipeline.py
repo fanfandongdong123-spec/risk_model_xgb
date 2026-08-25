@@ -320,7 +320,7 @@ class RiskModelPipeline:
             feature_names=feature_names,
         )
 
-        train_params = dict(self.config.xgb_params if params is None else params)
+        train_params = dict(params) if params else dict(self.config.xgb_params)
         rounds = self.config.num_boost_round if num_boost_round is None else num_boost_round
         verbose = self.config.verbose_eval if verbose_eval is None else verbose_eval
         evals_result = {}
