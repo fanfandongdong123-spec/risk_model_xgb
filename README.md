@@ -64,7 +64,9 @@ config = PipelineConfig(
 )
 
 pipeline = RiskModelPipeline(config)
-result = pipeline.run()
+result = pipeline.run(
+    weight_col="weight",
+)
 
 xgb_mod = result.model
 top_var_list = result.selected_vars
@@ -162,13 +164,31 @@ evals_result = train_result.evals_result
 
 `weight_col` 只应用于 Dev 训练集，与 `xgb.DMatrix(..., weight=sample_weight)` 等价；验证集不加权。传入 `None` 表示不使用样本权重。独立训练使用 KS 作为自定义评估指标，并按验证集 KS 执行早停。
 
-完整 pipeline 同样支持权重：
+## 完整 Pipeline 使用样本权重
+
+从 Presto 拉取数据时，`weight_col` 填写样本表中的权重字段名：
+
+```python
+result = pipeline.run(
+    weight_col="weight",
+)
+```
+
+此时 `hive_store.risk_model.your_sample_table` 必须包含 `weight` 字段。该字段会随样本表一起下载，并应用于变量初筛模型和最终模型的 Dev 训练集。验证集不加权。
+
+手动传入 DataFrame 时同样支持：
 
 ```python
 result = pipeline.run(
     df=df_input,
     weight_col="weight",
 )
+```
+
+不需要样本权重时，省略该参数或传入 `None`：
+
+```python
+result = pipeline.run()
 ```
 
 ## 数据拼接和样本划分
