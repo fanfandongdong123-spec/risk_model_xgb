@@ -14,6 +14,7 @@ config = PipelineConfig(
     join_key_feature="main_iou_id",
     target_col="fpd15",
     seg_col="seg_v",
+    split_by_person=True,  # False: 按样本行随机划分；已有 seg_v 时沿用原分组
     top_n_feature=300,
     miss_threshold=0.95,
     single_value_threshold=0.95,
@@ -52,7 +53,7 @@ result = pipeline.run()
 # result = pipeline.run(df=df_input, return_data=True)
 # model_data = result.data
 
-# Option 5: train separately; missing seg_v is split automatically by person_uuid
+# Option 5: train separately; missing seg_v is split using config.split_by_person
 # train_result = pipeline.train_model(
 #     df=df_input,
 #     feature_names=["mf_xxx_1", "mf_xxx_2"],
@@ -71,6 +72,11 @@ result = pipeline.run()
 # train_df = split_result.train
 # val_df = split_result.val
 #
+# To split rows randomly instead of grouping by person_uuid:
+# config.split_by_person = False
+# split_result = pipeline.split_dataset(df_input, train_frac=0.7, random_state=42)
+# df_with_seg = split_result.data
+#
 # train_result = pipeline.train_model(
 #     df=df_with_seg,
 #     feature_names=["mf_xxx_1", "mf_xxx_2"],
@@ -85,6 +91,16 @@ result = pipeline.run()
 # train_ks = train_result.ks_dev
 # val_ks = train_result.ks_val
 # evals_result = train_result.evals_result
+
+# Option 6: use row-level random splitting throughout the pipeline
+# config.split_by_person = False
+# config.random_seed = 42
+# pipeline = RiskModelPipeline(config)
+# result = pipeline.run()  # an existing seg_v still takes precedence
+#
+# To override an existing seg_v or customize the split ratio:
+# split_result = pipeline.split_dataset(df_input, train_frac=0.8, random_state=42)
+# result = pipeline.run(df=split_result.data)
 
 xgb_model = result.model
 selected_vars = result.selected_vars

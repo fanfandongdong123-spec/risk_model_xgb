@@ -23,6 +23,7 @@ class PipelineConfig:
     dev_value: str = "dev"
     val_value: str = "val"
     random_seed: int = 42
+    split_by_person: bool = True  # False: 按样本行随机划分；True: 同一用户保持同组
 
     top_n_feature: int = 300
     miss_threshold: float = 0.95

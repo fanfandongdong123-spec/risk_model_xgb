@@ -84,7 +84,9 @@ class RiskModelPipeline:
     ) -> tuple[str, list[str], dict[str, list[str]]]:
         feat2table, _ = self.load_table_metadata()
         table_vars, lost_vars = group_vars_by_table(var_lst, feat2table)
-        sql = build_join_sql(self.config, table_vars, include_all_sample_cols)
+        sql = build_join_sql(
+            self.config, table_vars, include_all_sample_cols, sample_cols=self.sample_cols
+        )
         return sql, lost_vars, table_vars
 
     def load_dataset(
@@ -215,7 +217,7 @@ class RiskModelPipeline:
         train_frac: float = 0.7,
         random_state: int | None = None,
     ) -> DatasetSplit:
-        """按 person_uuid 划分 Dev/Val，同一人的全部订单保持在同一组。"""
+        """按配置划分 Dev/Val；默认按用户，split_by_person=False 时按行随机划分。"""
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df 必须是 pandas DataFrame")
         if df.empty:
@@ -223,29 +225,42 @@ class RiskModelPipeline:
         if not 0 < train_frac < 1:
             raise ValueError("train_frac 必须在 0 和 1 之间")
 
-        person_col = self.config.person_uuid_col
-        if person_col not in df.columns:
-            raise KeyError(f"缺少按人划分所需字段: {person_col}")
-
         random_state = self.config.random_seed if random_state is None else random_state
         data = df.copy()
-        dev_persons = (
-            data[person_col]
-            .drop_duplicates()
-            .sample(frac=train_frac, random_state=random_state)
-        )
+        if self.config.split_by_person:
+            person_col = self.config.person_uuid_col
+            if person_col not in data.columns:
+                raise KeyError(f"缺少按人划分所需字段: {person_col}")
+            dev_persons = (
+                data[person_col]
+                .drop_duplicates()
+                .sample(frac=train_frac, random_state=random_state)
+            )
+            dev_mask = data[person_col].isin(dev_persons).to_numpy()
+            split_description = f"按 {person_col}"
+        else:
+            # 使用行位置，避免原始索引重复时把不同样本错误地绑定到同组。
+            dev_positions = (
+                pd.Series(np.arange(len(data)))
+                .sample(frac=train_frac, random_state=random_state)
+                .to_numpy()
+            )
+            dev_mask = np.zeros(len(data), dtype=bool)
+            dev_mask[dev_positions] = True
+            split_description = "按样本行随机"
+
         data[self.config.seg_col] = np.where(
-            data[person_col].isin(dev_persons),
+            dev_mask,
             self.config.dev_value,
             self.config.val_value,
         )
         train = data.loc[data[self.config.seg_col].eq(self.config.dev_value)].copy()
         val = data.loc[data[self.config.seg_col].eq(self.config.val_value)].copy()
         if train.empty or val.empty:
-            raise ValueError("划分后 Dev 或 Val 为空，请增加用户数或调整 train_frac")
+            raise ValueError("划分后 Dev 或 Val 为空，请增加样本/用户数或调整 train_frac")
 
         print(
-            f"按 {person_col} 划分完成: "
+            f"{split_description}划分完成: "
             f"Dev={len(train)}, Val={len(val)}, train_frac={train_frac}"
         )
         return DatasetSplit(data=data, train=train, val=val)
@@ -264,7 +279,7 @@ class RiskModelPipeline:
         train_frac: float = 0.7,
         random_state: int | None = None,
     ) -> ModelTrainingResult:
-        """单独训练 XGBoost；缺少 seg 字段时可按 person_uuid 自动划分。"""
+        """单独训练 XGBoost；缺少 seg 字段时按配置自动划分。"""
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df 必须是 pandas DataFrame")
         if df.empty:
@@ -276,7 +291,7 @@ class RiskModelPipeline:
                     f"输入 df 缺少分组字段: {self.config.seg_col}; "
                     "请先调用 split_dataset，或设置 auto_split=True"
                 )
-            print(f"未检测到 {self.config.seg_col}，自动按用户划分 Dev/Val")
+            print(f"未检测到 {self.config.seg_col}，按配置自动划分 Dev/Val")
             df = self.split_dataset(
                 df,
                 train_frac=train_frac,

@@ -46,17 +46,21 @@ def build_join_sql(
     config: PipelineConfig,
     table_vars: dict[str, list[str]],
     include_all_sample_cols: bool = False,
+    sample_cols: list[str] | None = None,
 ) -> str:
-    select_cols = (
-        ["s.*"]
-        if include_all_sample_cols
-        else [
-            f"s.{config.join_key_sample}",
-            f"s.{config.person_uuid_col}",
-            f"s.{config.target_col}",
-            f"s.{config.seg_col}",
-        ]
-    )
+    if include_all_sample_cols:
+        select_cols = ["s.*"]
+    else:
+        sample_fields = [config.join_key_sample]
+        # seg 可在下载后生成；按行划分也不要求样本表存在用户字段。
+        if (
+            sample_cols is not None and config.person_uuid_col in sample_cols
+        ) or (sample_cols is None and config.split_by_person):
+            sample_fields.append(config.person_uuid_col)
+        sample_fields.append(config.target_col)
+        if sample_cols is None or config.seg_col in sample_cols:
+            sample_fields.append(config.seg_col)
+        select_cols = [f"s.{col}" for col in dict.fromkeys(sample_fields)]
     join_sql = []
 
     for i, (table, vars_) in enumerate(table_vars.items()):

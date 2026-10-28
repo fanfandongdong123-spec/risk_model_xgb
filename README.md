@@ -9,7 +9,7 @@
 - 自动过滤高缺失率和高单一值占比变量
 - 使用 XGBoost 初筛变量重要性并选择 Top N 特征
 - 训练最终模型并输出 Dev / Val KS
-- 样本没有 `seg_v` 时，按 `person_uuid` 的 70%/30% 划分 Dev/Val；同一人的所有订单保持在同一组
+- 样本没有 `seg_v` 时，默认按 `person_uuid` 的 70%/30% 划分 Dev/Val；设置 `split_by_person=False` 可按样本行随机划分
 
 ## 安装依赖
 
@@ -44,6 +44,7 @@ config = PipelineConfig(
     person_uuid_col="person_uuid",
     target_col="fpd15",
     seg_col="seg_v",
+    split_by_person=True,  # False 表示按样本行随机划分
     top_n_feature=300,
     num_boost_round=800,
     xgb_params={
@@ -118,7 +119,35 @@ result = pipeline.run(
 )
 ```
 
-输入的 DataFrame 至少需要包含目标字段（默认 `fpd15`）和特征字段。如果没有 `seg_v`，还需包含 `person_uuid`，pipeline 会保证同一个人的全部订单处于同一个 Dev/Val 分组。传入的 DataFrame 会先复制，原始对象不会被修改。此方式返回的 `result.sql` 是空字符串。
+输入的 DataFrame 至少需要包含目标字段（默认 `fpd15`）和特征字段。如果没有 `seg_v`，默认还需包含 `person_uuid`，pipeline 会保证同一个人的全部订单处于同一个 Dev/Val 分组。设置 `split_by_person=False` 后不需要 `person_uuid`。传入的 DataFrame 会先复制，原始对象不会被修改。此方式返回的 `result.sql` 是空字符串。
+
+## 选择 Dev / Val 划分方式
+
+`person_uuid_col` 指定用户字段名，`split_by_person` 决定自动划分时是否按该字段分组：
+
+| 输入数据 | 配置 | 行为 |
+| --- | --- | --- |
+| 已有 `seg_v` | 任意 `split_by_person` | `run()` 和 `train_model()` 沿用已有分组 |
+| 没有 `seg_v` | `split_by_person=True`（默认） | 按去重用户随机划分；同一用户的全部记录保持同组 |
+| 没有 `seg_v` | `split_by_person=False` | 按样本行随机划分；不要求存在 `person_uuid` |
+
+例如，直接按样本行随机划分后运行完整流程：
+
+```python
+config.split_by_person = False
+config.random_seed = 42
+pipeline = RiskModelPipeline(config)
+
+# 从配置的样本表和特征表读取数据
+result = pipeline.run()
+
+# 或使用已有 DataFrame
+# result = pipeline.run(df=df_input)
+```
+
+自动划分默认使用约 70% 作为 Dev、30% 作为 Val。按用户划分时该比例针对用户数，实际样本行比例可能不同；按行划分时该比例针对样本行数，不按标签分层。按行随机划分允许同一用户同时出现在 Dev 和 Val 中，重复客户或案件较多时，验证效果可能偏乐观。
+
+数据内容和行顺序相同时，固定随机种子可以复现划分。Presto 查询没有固定排序时，不保证跨次下载的行顺序一致；如需固定分组，可保存首次生成的 `seg_v` 后重复使用。
 
 ## 单独划分数据和训练模型
 
@@ -136,7 +165,17 @@ train_df = split_result.train
 val_df = split_result.val
 ```
 
-单独训练模型。如果输入 DataFrame 没有 `seg_v`，默认会自动按照 `person_uuid` 划分，并通过 `train_result.data` 返回带有 `seg_v` 的数据：
+如果希望不按用户分组，直接按样本行随机划分：
+
+```python
+config.split_by_person = False
+split_result = pipeline.split_dataset(df_input, train_frac=0.7, random_state=42)
+df_with_seg = split_result.data
+```
+
+也可以在创建 `PipelineConfig` 时设置 `split_by_person=False`，`run()` 和 `train_model()` 缺少 `seg_v` 时都会使用该设置。按行随机划分允许同一用户出现在 Dev 和 Val 中；如需覆盖已有 `seg_v`，显式调用 `split_dataset()`。
+
+单独训练模型。如果输入 DataFrame 没有 `seg_v`，会根据 `config.split_by_person` 自动划分（默认按用户），并通过 `train_result.data` 返回带有 `seg_v` 的数据：
 
 ```python
 train_result = pipeline.train_model(
@@ -161,6 +200,8 @@ evals_result = train_result.evals_result
 ```
 
 传入的数据已经包含 `seg_v` 时会直接使用现有分组；缺少时，`auto_split=True` 会自动划分。原始 DataFrame 不会被修改，带分组字段的数据从 `train_result.data` 获取。设置 `auto_split=False` 可以在缺少 `seg_v` 时直接报错。
+
+`train_frac` 和 `random_state` 可在 `split_dataset()` 或 `train_model()` 中设置；省略 `random_state` 时使用 `config.random_seed`。`run()` 默认按 70%/30% 自动划分，如需其他比例，可先调用 `split_dataset()`，再把 `split_result.data` 传给 `run()`。
 
 `weight_col` 只应用于 Dev 训练集，与 `xgb.DMatrix(..., weight=sample_weight)` 等价；验证集不加权。传入 `None` 表示不使用样本权重。独立训练使用 KS 作为自定义评估指标，并按验证集 KS 执行早停。
 
@@ -195,4 +236,4 @@ result = pipeline.run()
 
 样本表字段 `po_id` 默认与特征表字段 `main_iou_id` 通过普通 `JOIN` 关联，因此只有成功匹配特征表的样本会保留。
 
-如果查询结果中已经存在 `seg_v`，pipeline 会直接使用原始分组。如果不存在，则先对 `person_uuid` 去重，随机抽取约 70% 的用户作为 Dev，其余作为 Val。随机种子由 `random_seed` 控制，默认值为 `42`。
+如果查询结果中已经存在 `seg_v`，pipeline 会直接使用原始分组。如果不存在，默认先对 `person_uuid` 去重，随机抽取约 70% 的用户作为 Dev，其余作为 Val；设置 `split_by_person=False` 时直接随机抽取约 70% 的样本行作为 Dev，其余作为 Val。随机种子由 `random_seed` 控制，默认值为 `42`。Presto 查询会根据样本表结构跳过不存在的 `seg_v` 和用户字段，再按配置执行自动划分。
