@@ -10,10 +10,18 @@
 - 使用 XGBoost 初筛变量重要性并选择 Top N 特征
 - 训练最终模型并输出 Dev / Val KS
 - 样本没有 `seg_v` 时，默认按 `person_uuid` 的 70%/30% 划分 Dev/Val；设置 `split_by_person=False` 可按样本行随机划分
+- 输出各阶段开始、完成和耗时，逐列预处理及模型训练会输出中间进度
+- Top N 特征选出后，将样本字段、`seg_v` 和入选特征自动保存至 `./output` 的 Parquet 文件
 
 ## 安装依赖
 
 项目需要 pandas、NumPy、SQLAlchemy、Presto SQLAlchemy 驱动和 XGBoost，并依赖运行环境中的 `titan.common.data_download.hdfs_to_local`。
+
+默认会保存 Parquet 数据，请安装 `pyarrow`（或已有 `fastparquet`）：
+
+```bash
+pip install pyarrow
+```
 
 ## Presto 连接
 
@@ -47,6 +55,9 @@ config = PipelineConfig(
     split_by_person=True,  # False 表示按样本行随机划分
     top_n_feature=300,
     num_boost_round=800,
+    output_dir="./output",
+    save_selected_data=True,
+    feature_log_interval=100,
     xgb_params={
         "booster": "gbtree",
         "objective": "binary:logistic",
@@ -84,6 +95,42 @@ print("未找到的变量:", lost_vars)
 
 display(imp_df.head(20))
 ```
+
+## 运行进度和筛选后数据保存
+
+完整流程会输出读取表结构、下载、Dev/Val 划分、类型转换、内存回收、缺失率过滤、单一值过滤、DMatrix 构建、初筛训练、Top N 选择、文件保存、正式训练及 KS 计算的阶段日志。日志包含时间与耗时，立即刷新，便于在 Notebook 中观察。
+
+- 类型转换、缺失率和单一值统计默认每处理 100 个特征输出一次，并输出首个和最后一个特征的处理进度；通过 `feature_log_interval` 调整。
+- 两次模型训练默认每 20 轮输出一次进度，并输出第 1 轮和最后一轮；通过 `verbose_eval` 调整。设置 `verbose_eval=False` 只关闭训练轮次输出，阶段日志仍会显示。
+- 下载函数内部的查询、传输和读取仍由 `hdfs_to_local` 自己输出；外层记录整次下载调用的耗时。
+
+`run()` 默认在初筛选出 Top N 后、正式训练前保存 Parquet，因此正式训练失败也不会丢失已成功保存的数据。默认路径示例：
+
+```text
+./output/selected_data_top300_20261028_153000_123456.parquet
+```
+
+`./output` 相对于 Python 当前工作目录（Notebook 可用 `Path.cwd()` 查看），目录不存在会自动创建；文件名包含实际入选特征数和时间戳。数据包含全部返回的样本行、样本字段、标签、自动生成或已有的 `seg_v` 及入选特征，不保存 DataFrame 索引。Presto 模式为此会读取样本表全部字段；DataFrame 模式把未列入候选特征的列作为样本字段。若可用特征不足 300 个，就保存实际选出的数量。
+
+文件保存不要求 `return_data=True`。训练完成后可通过返回路径读取：
+
+```python
+import pandas as pd
+
+result = pipeline.run()
+print(result.selected_data_path)
+selected_data = pd.read_parquet(result.selected_data_path)
+```
+
+如需调整路径或关闭文件保存：
+
+```python
+config.output_dir = "./output"
+config.save_selected_data = True  # False：关闭保存，result.selected_data_path 为 None
+config.feature_log_interval = 100
+```
+
+保存失败会显示失败阶段并抛出异常，正式训练不会继续。单独调用 `train_model()` 不执行 Top N 筛选，也不自动保存该文件。
 
 如需同时返回建模后的数据，设置 `return_data=True`：
 
@@ -237,3 +284,11 @@ result = pipeline.run()
 样本表字段 `po_id` 默认与特征表字段 `main_iou_id` 通过普通 `JOIN` 关联，因此只有成功匹配特征表的样本会保留。
 
 如果查询结果中已经存在 `seg_v`，pipeline 会直接使用原始分组。如果不存在，默认先对 `person_uuid` 去重，随机抽取约 70% 的用户作为 Dev，其余作为 Val；设置 `split_by_person=False` 时直接随机抽取约 70% 的样本行作为 Dev，其余作为 Val。随机种子由 `random_seed` 控制，默认值为 `42`。Presto 查询会根据样本表结构跳过不存在的 `seg_v` 和用户字段，再按配置执行自动划分。
+
+## 本地验证
+
+安装上述依赖后，在项目目录运行以下小样本测试。测试使用真实 XGBoost 和 Parquet 读写，内部下载接口使用模拟数据，不连接 Presto：
+
+```bash
+python -m unittest discover -s tests -v
+```

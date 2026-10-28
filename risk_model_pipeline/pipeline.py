@@ -1,5 +1,10 @@
 import gc
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
+from importlib.util import find_spec
+from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import pandas as pd
@@ -12,6 +17,31 @@ from .metrics import calc_ks
 from .sql import build_feature_table_mapping, build_join_sql, get_table_columns, group_vars_by_table
 
 
+def _log(message: str):
+    print(f"[{datetime.now():%H:%M:%S}] {message}", flush=True)
+
+
+class _TrainingProgress(xgb.callback.TrainingCallback):
+    def __init__(self, stage: str, rounds: int, period: int):
+        self.stage = stage
+        self.rounds = rounds
+        self.period = max(1, period)
+        self.started = 0.0
+
+    def before_training(self, model):
+        self.started = perf_counter()
+        return model
+
+    def after_iteration(self, model, epoch, evals_log):
+        completed = epoch + 1
+        if completed == 1 or completed % self.period == 0 or completed == self.rounds:
+            _log(
+                f"{self.stage}: {completed}/{self.rounds} 轮，"
+                f"耗时 {perf_counter() - self.started:.1f} 秒"
+            )
+        return False
+
+
 @dataclass
 class PipelineResult:
     model: xgb.Booster
@@ -22,6 +52,7 @@ class PipelineResult:
     sql: str
     lost_vars: list[str]
     data: pd.DataFrame | None = None
+    selected_data_path: str | None = None
 
 
 @dataclass
@@ -47,6 +78,62 @@ class RiskModelPipeline:
         self.feat2table: dict[str, str] | None = None
         self.table_cols: dict[str, list[str]] | None = None
         self.sample_cols: list[str] | None = None
+
+    @contextmanager
+    def _stage(self, name: str):
+        started = perf_counter()
+        _log(f"开始{name}...")
+        try:
+            yield
+        except Exception:
+            _log(f"{name}失败，耗时 {perf_counter() - started:.1f} 秒")
+            raise
+        else:
+            _log(f"{name}完成，耗时 {perf_counter() - started:.1f} 秒")
+
+    def _feature_progress(self, stage: str, completed: int, total: int, started: float):
+        interval = max(1, self.config.feature_log_interval)
+        if completed == 1 or completed % interval == 0 or completed == total:
+            _log(
+                f"{stage}: {completed}/{total} 个特征，"
+                f"耗时 {perf_counter() - started:.1f} 秒"
+            )
+
+    def _training_callbacks(self, stage: str, rounds: int, verbose: int | bool):
+        if not verbose:
+            return []
+        return [_TrainingProgress(stage, rounds, int(verbose))]
+
+    def _selected_output_columns(
+        self,
+        df: pd.DataFrame,
+        var_candidate: list[str],
+        selected_vars: list[str],
+        from_sql: bool,
+    ) -> list[str]:
+        sample_cols = (
+            self.sample_cols
+            if from_sql and self.sample_cols is not None
+            else [col for col in df.columns if col not in var_candidate]
+        )
+        return list(dict.fromkeys(
+            col for col in [*sample_cols, self.config.seg_col, *selected_vars]
+            if col in df.columns
+        ))
+
+    def _save_selected_dataset(self, df: pd.DataFrame, output_cols: list[str], n_features: int) -> str:
+        output_dir = Path(self.config.output_dir).expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"selected_data_top{n_features}_{datetime.now():%Y%m%d_%H%M%S_%f}.parquet"
+        output_path = output_dir / filename
+        with self._stage("保存筛选后数据为 Parquet"):
+            _log(f"保存路径: {output_path}；shape=({len(df)}, {len(output_cols)})")
+            try:
+                df.loc[:, output_cols].to_parquet(output_path, index=False)
+            except ImportError as exc:
+                raise ImportError("保存 Parquet 需要 pyarrow 或 fastparquet，请先运行 pip install pyarrow") from exc
+            _log(f"文件大小: {output_path.stat().st_size / 1024 ** 2:.1f} MB")
+        return str(output_path)
 
     def _create_engine(self):
         return create_engine(self.config.presto_url(), connect_args={"protocol": "https"})
@@ -94,16 +181,19 @@ class RiskModelPipeline:
         var_lst: list[str],
         include_all_sample_cols: bool = False,
     ) -> tuple[pd.DataFrame, str, list[str], list[str]]:
-        sql, lost_vars, table_vars = self.build_sql(var_lst, include_all_sample_cols)
+        with self._stage("生成样本与特征关联 SQL"):
+            sql, lost_vars, table_vars = self.build_sql(var_lst, include_all_sample_cols)
 
-        print("开始拉取样本+特征宽表...")
-        df = hdfs_to_local(sql=sql)
-        print(f"数据拉取完成: shape={df.shape}")
+        with self._stage("拉取样本+特征宽表"):
+            df = hdfs_to_local(sql=sql)
+            _log(f"数据拉取完成: shape={df.shape}")
 
         var_candidate = [v for vars_ in table_vars.values() for v in vars_ if v in df.columns]
-        df = self._auto_split_seg(df)
+        with self._stage("检查并划分 Dev/Val"):
+            df = self._auto_split_seg(df)
         df = self._reduce_memory(df, var_candidate)
-        gc.collect()
+        with self._stage("预处理后内存回收"):
+            gc.collect()
         return df, sql, lost_vars, var_candidate
 
     def run(
@@ -113,72 +203,106 @@ class RiskModelPipeline:
         return_data: bool = False,
         weight_col: str | None = None,
     ) -> PipelineResult:
+        run_started = perf_counter()
+        _log("开始完整建模流程")
+        if self.config.save_selected_data:
+            with self._stage("检查 Parquet 保存依赖"):
+                if find_spec("pyarrow") is None and find_spec("fastparquet") is None:
+                    raise ImportError("保存 Parquet 需要 pyarrow 或 fastparquet，请先运行 pip install pyarrow")
         if df is None:
             if var_lst is None:
-                var_lst = self.get_all_features()
-                print(f"汇总全部 {self.config.feature_prefix} 特征数: {len(var_lst)}")
+                with self._stage("读取表结构并汇总候选特征"):
+                    var_lst = self.get_all_features()
+                    _log(f"汇总全部 {self.config.feature_prefix} 特征数: {len(var_lst)}")
 
             df, sql, lost_vars, var_candidate = self.load_dataset(
                 var_lst,
-                include_all_sample_cols=return_data or weight_col is not None,
+                include_all_sample_cols=(
+                    return_data or weight_col is not None or self.config.save_selected_data
+                ),
             )
         else:
-            df, lost_vars, var_candidate = self._prepare_input_dataframe(df, var_lst)
+            with self._stage("准备输入 DataFrame"):
+                df, lost_vars, var_candidate = self._prepare_input_dataframe(df, var_lst)
             sql = ""
 
         var_after_miss = self.filter_by_missing(df, var_candidate)
         var_after_single = self.filter_by_single_value(df, var_after_miss)
+        if not var_after_single:
+            raise ValueError("缺失率和单一值过滤后没有可用特征，请检查数据或调整阈值")
 
         dev_mask = df[self.config.seg_col].eq(self.config.dev_value).to_numpy()
         val_mask = df[self.config.seg_col].eq(self.config.val_value).to_numpy()
+        if not dev_mask.any() or not val_mask.any():
+            raise ValueError(f"{self.config.seg_col} 必须同时包含 Dev 和 Val 分组")
 
         y_dev = df.loc[dev_mask, self.config.target_col].to_numpy()
         y_val = df.loc[val_mask, self.config.target_col].to_numpy()
         train_weight = self._get_train_weight(df, dev_mask, weight_col)
 
-        print("开始初筛模型训练...")
-        dtrain_tmp = xgb.DMatrix(
-            df.loc[dev_mask, var_after_single],
-            label=y_dev,
-            weight=train_weight,
-            feature_names=var_after_single,
-        )
-        model_tmp = xgb.train(
-            self.config.xgb_params,
-            dtrain_tmp,
-            num_boost_round=self.config.num_boost_round,
-        )
-        importance_df = self.get_importance_df(model_tmp, var_after_single)
-        selected_vars = importance_df.head(self.config.top_n_feature)["feature"].tolist()
+        with self._stage(f"构建初筛 DMatrix（{len(y_dev)} 行、{len(var_after_single)} 个特征）"):
+            dtrain_tmp = xgb.DMatrix(
+                df.loc[dev_mask, var_after_single],
+                label=y_dev,
+                weight=train_weight,
+                feature_names=var_after_single,
+            )
+        with self._stage("初筛模型训练"):
+            model_tmp = xgb.train(
+                self.config.xgb_params,
+                dtrain_tmp,
+                num_boost_round=self.config.num_boost_round,
+                callbacks=self._training_callbacks(
+                    "初筛模型训练", self.config.num_boost_round, self.config.verbose_eval
+                ),
+            )
+        with self._stage(f"按 gain 选择 Top{self.config.top_n_feature} 特征"):
+            importance_df = self.get_importance_df(model_tmp, var_after_single)
+            selected_vars = importance_df.head(self.config.top_n_feature)["feature"].tolist()
+            if not selected_vars:
+                raise ValueError("未选出任何特征，请确认 top_n_feature 大于 0")
+            _log(f"实际选中特征数: {len(selected_vars)}")
 
         del dtrain_tmp, model_tmp
-        gc.collect()
+        with self._stage("初筛后内存回收"):
+            gc.collect()
 
-        print(f"Top{self.config.top_n_feature} 特征筛选完成，开始正式训练...")
-        dtrain = xgb.DMatrix(
-            df.loc[dev_mask, selected_vars],
-            label=y_dev,
-            weight=train_weight,
-            feature_names=selected_vars,
+        output_cols = self._selected_output_columns(
+            df, var_candidate, selected_vars, from_sql=bool(sql)
         )
-        dval = xgb.DMatrix(
-            df.loc[val_mask, selected_vars],
-            label=y_val,
-            feature_names=selected_vars,
-        )
+        selected_data_path = None
+        if self.config.save_selected_data:
+            selected_data_path = self._save_selected_dataset(df, output_cols, len(selected_vars))
 
-        model = xgb.train(
-            self.config.xgb_params,
-            dtrain,
-            num_boost_round=self.config.num_boost_round,
-            evals=[(dtrain, "dev"), (dval, "val")],
-            verbose_eval=self.config.verbose_eval,
-        )
-
-        pred_dev = model.predict(dtrain)
-        pred_val = model.predict(dval)
-        ks_dev = calc_ks(y_dev, pred_dev)
-        ks_val = calc_ks(y_val, pred_val)
+        with self._stage(f"构建正式训练 Dev DMatrix（{len(selected_vars)} 个特征）"):
+            dtrain = xgb.DMatrix(
+                df.loc[dev_mask, selected_vars],
+                label=y_dev,
+                weight=train_weight,
+                feature_names=selected_vars,
+            )
+        with self._stage("构建正式训练 Val DMatrix"):
+            dval = xgb.DMatrix(
+                df.loc[val_mask, selected_vars],
+                label=y_val,
+                feature_names=selected_vars,
+            )
+        with self._stage("正式模型训练"):
+            model = xgb.train(
+                self.config.xgb_params,
+                dtrain,
+                num_boost_round=self.config.num_boost_round,
+                evals=[(dtrain, "dev"), (dval, "val")],
+                verbose_eval=self.config.verbose_eval,
+                callbacks=self._training_callbacks(
+                    "正式模型训练", self.config.num_boost_round, self.config.verbose_eval
+                ),
+            )
+        with self._stage("预测并计算 Dev/Val KS"):
+            pred_dev = model.predict(dtrain)
+            pred_val = model.predict(dval)
+            ks_dev = calc_ks(y_dev, pred_dev)
+            ks_val = calc_ks(y_val, pred_val)
 
         print("\n==== 最终模型结果 ====")
         print(f"Dev KS: {ks_dev:.4f}")
@@ -186,19 +310,10 @@ class RiskModelPipeline:
 
         result_data = None
         if return_data:
-            sample_cols = (
-                self.sample_cols
-                if sql and self.sample_cols is not None
-                else [col for col in df.columns if col not in var_candidate]
-            )
-            model_features = model.feature_names or selected_vars
-            output_cols = list(
-                dict.fromkeys(
-                    [col for col in sample_cols if col in df.columns]
-                    + [col for col in model_features if col in df.columns]
-                )
-            )
-            result_data = df.loc[:, output_cols].copy()
+            with self._stage("准备返回筛选后 DataFrame"):
+                result_data = df.loc[:, output_cols].copy()
+
+        _log(f"完整建模流程完成，总耗时 {perf_counter() - run_started:.1f} 秒")
 
         return PipelineResult(
             model=model,
@@ -209,6 +324,7 @@ class RiskModelPipeline:
             sql=sql,
             lost_vars=lost_vars,
             data=result_data,
+            selected_data_path=selected_data_path,
         )
 
     def split_dataset(
@@ -225,6 +341,8 @@ class RiskModelPipeline:
         if not 0 < train_frac < 1:
             raise ValueError("train_frac 必须在 0 和 1 之间")
 
+        started = perf_counter()
+        _log(f"开始划分 Dev/Val，样本行数: {len(df)}")
         random_state = self.config.random_seed if random_state is None else random_state
         data = df.copy()
         if self.config.split_by_person:
@@ -259,9 +377,10 @@ class RiskModelPipeline:
         if train.empty or val.empty:
             raise ValueError("划分后 Dev 或 Val 为空，请增加样本/用户数或调整 train_frac")
 
-        print(
+        _log(
             f"{split_description}划分完成: "
-            f"Dev={len(train)}, Val={len(val)}, train_frac={train_frac}"
+            f"Dev={len(train)}, Val={len(val)}, train_frac={train_frac}，"
+            f"耗时 {perf_counter() - started:.1f} 秒"
         )
         return DatasetSplit(data=data, train=train, val=val)
 
@@ -323,36 +442,41 @@ class RiskModelPipeline:
         y_val = df.loc[val_mask, target_col].to_numpy()
         train_weight = self._get_train_weight(df, dev_mask, weight_col)
 
-        dtrain = xgb.DMatrix(
-            df.loc[dev_mask, feature_names],
-            label=y_dev,
-            weight=train_weight,
-            feature_names=feature_names,
-        )
-        dval = xgb.DMatrix(
-            df.loc[val_mask, feature_names],
-            label=y_val,
-            feature_names=feature_names,
-        )
+        with self._stage("构建单独训练 Dev DMatrix"):
+            dtrain = xgb.DMatrix(
+                df.loc[dev_mask, feature_names],
+                label=y_dev,
+                weight=train_weight,
+                feature_names=feature_names,
+            )
+        with self._stage("构建单独训练 Val DMatrix"):
+            dval = xgb.DMatrix(
+                df.loc[val_mask, feature_names],
+                label=y_val,
+                feature_names=feature_names,
+            )
 
         train_params = dict(params) if params else dict(self.config.xgb_params)
         rounds = self.config.num_boost_round if num_boost_round is None else num_boost_round
         verbose = self.config.verbose_eval if verbose_eval is None else verbose_eval
         evals_result = {}
-        model = xgb.train(
-            train_params,
-            dtrain,
-            num_boost_round=rounds,
-            evals=[(dtrain, "dev"), (dval, "val")],
-            feval=self._xgb_eval_ks,
-            maximize=True,
-            verbose_eval=verbose,
-            early_stopping_rounds=early_stopping_rounds,
-            evals_result=evals_result,
-        )
+        with self._stage("单独模型训练"):
+            model = xgb.train(
+                train_params,
+                dtrain,
+                num_boost_round=rounds,
+                evals=[(dtrain, "dev"), (dval, "val")],
+                feval=self._xgb_eval_ks,
+                maximize=True,
+                verbose_eval=verbose,
+                early_stopping_rounds=early_stopping_rounds,
+                evals_result=evals_result,
+                callbacks=self._training_callbacks("单独模型训练", rounds, verbose),
+            )
 
-        ks_dev = calc_ks(y_dev, model.predict(dtrain))
-        ks_val = calc_ks(y_val, model.predict(dval))
+        with self._stage("单独训练预测并计算 KS"):
+            ks_dev = calc_ks(y_dev, model.predict(dtrain))
+            ks_val = calc_ks(y_val, model.predict(dval))
         print("\n==== 单独训练结果 ====")
         print(f"Dev KS: {ks_dev:.4f}")
         print(f"Val KS: {ks_val:.4f}")
@@ -408,7 +532,8 @@ class RiskModelPipeline:
         if self.config.target_col not in df.columns:
             raise KeyError(f"输入 df 缺少目标字段: {self.config.target_col}")
 
-        df = df.copy()
+        with self._stage("复制输入 DataFrame"):
+            df = df.copy()
         if var_lst is None:
             var_candidate = sorted(
                 col for col in df.columns if col.startswith(self.config.feature_prefix)
@@ -424,45 +549,58 @@ class RiskModelPipeline:
         if not var_candidate:
             raise ValueError("输入 df 中没有可用于训练的特征")
 
-        df = self._auto_split_seg(df)
+        with self._stage("检查并划分 Dev/Val"):
+            df = self._auto_split_seg(df)
         df = self._reduce_memory(df, var_candidate)
-        gc.collect()
-        print(f"使用手动输入 DataFrame 训练: shape={df.shape}")
+        with self._stage("预处理后内存回收"):
+            gc.collect()
+        _log(f"使用手动输入 DataFrame 训练: shape={df.shape}")
         return df, lost_vars, var_candidate
 
     def _auto_split_seg(self, df: pd.DataFrame) -> pd.DataFrame:
         if self.config.seg_col in df.columns:
-            print(f"检测到 {self.config.seg_col} 字段，使用原始分组")
+            _log(f"检测到 {self.config.seg_col} 字段，使用原始分组")
             return df
 
         return self.split_dataset(df).data
 
     def _reduce_memory(self, df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
-        for col in feature_cols:
-            if col in df.columns and df[col].dtype != "float32":
-                df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
+        with self._stage("特征数值转换与 float32 压缩"):
+            started = perf_counter()
+            for i, col in enumerate(feature_cols, 1):
+                if col in df.columns and df[col].dtype != "float32":
+                    df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
+                self._feature_progress("类型转换", i, len(feature_cols), started)
 
-        if self.config.target_col in df.columns:
-            df[self.config.target_col] = df[self.config.target_col].astype("int8")
+            if self.config.target_col in df.columns:
+                df[self.config.target_col] = df[self.config.target_col].astype("int8")
 
         return df
 
     def filter_by_missing(self, df: pd.DataFrame, vars_: list[str]) -> list[str]:
-        miss_rate = df[vars_].isna().mean()
-        keep = miss_rate[miss_rate <= self.config.miss_threshold].index.tolist()
-        print(f"缺失率过滤: {len(vars_)} -> {len(keep)}")
+        keep = []
+        with self._stage("缺失率过滤"):
+            started = perf_counter()
+            # 逐列统计，避免为整张宽表一次性创建缺失标记矩阵。
+            for i, col in enumerate(vars_, 1):
+                if df[col].isna().mean() <= self.config.miss_threshold:
+                    keep.append(col)
+                self._feature_progress("缺失率统计", i, len(vars_), started)
+            _log(f"缺失率过滤: {len(vars_)} -> {len(keep)}")
         return keep
 
     def filter_by_single_value(self, df: pd.DataFrame, vars_: list[str]) -> list[str]:
         n = len(df)
         keep = []
 
-        for col in vars_:
-            top_ratio = df[col].value_counts(dropna=False).iloc[0] / n
-            if top_ratio <= self.config.single_value_threshold:
-                keep.append(col)
-
-        print(f"单一值过滤: {len(vars_)} -> {len(keep)}")
+        with self._stage("单一值过滤"):
+            started = perf_counter()
+            for i, col in enumerate(vars_, 1):
+                top_ratio = df[col].value_counts(dropna=False).iloc[0] / n
+                if top_ratio <= self.config.single_value_threshold:
+                    keep.append(col)
+                self._feature_progress("单一值统计", i, len(vars_), started)
+            _log(f"单一值过滤: {len(vars_)} -> {len(keep)}")
         return keep
 
     @staticmethod

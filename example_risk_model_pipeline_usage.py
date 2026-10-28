@@ -19,6 +19,9 @@ config = PipelineConfig(
     miss_threshold=0.95,
     single_value_threshold=0.95,
     num_boost_round=800,
+    output_dir="./output",  # 相对于运行时工作目录
+    save_selected_data=True,  # Top N 选出后、正式训练前自动保存 Parquet
+    feature_log_interval=100,  # 每处理100个特征输出一次进度
     xgb_params={
         "booster": "gbtree",
         "objective": "binary:logistic",
@@ -109,3 +112,8 @@ importance_df = result.importance_df
 print("Dev KS:", result.ks_dev)
 print("Val KS:", result.ks_val)
 print("Selected vars:", selected_vars[:20])
+print("Selected data Parquet:", result.selected_data_path)
+
+# Read the saved sample columns + seg_v + selected features:
+# import pandas as pd
+# selected_data = pd.read_parquet(result.selected_data_path)
