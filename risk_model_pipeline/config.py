@@ -48,7 +48,7 @@ class PipelineConfig:
         "seed": 12345,
     })
 
-    output_dir: str = "./output"
+    output_dir: str = "./data"
     save_selected_data: bool = True
     feature_log_interval: int = 100  # 逐列处理时每完成多少个特征输出一次进度
 

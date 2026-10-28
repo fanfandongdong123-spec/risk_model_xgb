@@ -50,7 +50,7 @@ class PipelineOutputTests(unittest.TestCase):
     def pipeline(self, **kwargs):
         options = dict(
             sample_table="sample", feature_table_list=["features"],
-            split_by_person=False, output_dir=str(self.root / "output"),
+            split_by_person=False, output_dir=str(self.root / "data"),
             top_n_feature=2, num_boost_round=3, feature_log_interval=2,
             verbose_eval=2,
             xgb_params={"objective": "binary:logistic", "tree_method": "hist",
@@ -71,7 +71,7 @@ class PipelineOutputTests(unittest.TestCase):
         result, logs = self.run_quietly(self.pipeline(), df=self.df, return_data=True)
         path = Path(result.selected_data_path)
         self.assertTrue(path.is_file())
-        self.assertEqual(path.parent, self.root / "output")
+        self.assertEqual(path.parent, self.root / "data")
         self.assertTrue(path.name.startswith("selected_data_top2_"))
         saved = pd.read_parquet(path)
         pd.testing.assert_frame_equal(saved, result.data.reset_index(drop=True))
@@ -112,7 +112,7 @@ class PipelineOutputTests(unittest.TestCase):
             self.pipeline(save_selected_data=False, verbose_eval=False), df=df, return_data=True
         )
         self.assertIsNone(result.selected_data_path)
-        self.assertFalse((self.root / "output").exists())
+        self.assertFalse((self.root / "data").exists())
         self.assertEqual(result.data.seg_v.tolist(), df.seg_v.tolist())
         self.assertIn("开始初筛模型训练", logs)
         self.assertNotIn("初筛模型训练: 1/3", logs)
@@ -125,7 +125,7 @@ class PipelineOutputTests(unittest.TestCase):
             nonlocal calls
             calls += 1
             if calls == 2:
-                self.assertEqual(len(list((self.root / "output").glob("*.parquet"))), 1)
+                self.assertEqual(len(list((self.root / "data").glob("*.parquet"))), 1)
                 raise RuntimeError("simulated final training failure")
             return original_train(*args, **kwargs)
 
@@ -133,7 +133,7 @@ class PipelineOutputTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(RuntimeError, "simulated final"):
                     self.pipeline().run(df=self.df)
-        files = list((self.root / "output").glob("*.parquet"))
+        files = list((self.root / "data").glob("*.parquet"))
         self.assertEqual(len(files), 1)
         self.assertEqual(len(pd.read_parquet(files[0])), len(self.df))
 
@@ -146,7 +146,7 @@ class PipelineOutputTests(unittest.TestCase):
             )
         self.assertIn("单独模型训练: 3/3", capture.getvalue())
         self.assertIn("seg_v", result.data)
-        self.assertFalse((self.root / "output").exists())
+        self.assertFalse((self.root / "data").exists())
 
     def test_all_filtered_features_fail_before_training(self):
         with redirect_stdout(io.StringIO()):
