@@ -22,6 +22,7 @@ config = PipelineConfig(
     output_dir="./data",  # 相对于运行时工作目录
     save_selected_data=True,  # Top N 选出后、正式训练前自动保存 Parquet
     feature_log_interval=100,  # 每处理100个特征输出一次进度
+    prefilter_features=True,  # 先按样本键预过滤特征表；False 可切回原方式对比
     xgb_params={
         "booster": "gbtree",
         "objective": "binary:logistic",
@@ -40,6 +41,10 @@ config = PipelineConfig(
 )
 
 pipeline = RiskModelPipeline(config)
+
+# Preview the prefilter SQL without downloading the dataset:
+# sql, lost_vars, table_vars = pipeline.build_sql(["mf_xxx_1", "mf_xxx_2"])
+# print(sql)
 
 # Option 1: use all features with the configured prefix, such as mf_
 result = pipeline.run()

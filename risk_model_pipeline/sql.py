@@ -48,6 +48,13 @@ def build_join_sql(
     include_all_sample_cols: bool = False,
     sample_cols: list[str] | None = None,
 ) -> str:
+    """按所需字段关联特征；默认先用去重样本键预过滤各特征表。"""
+    def quote_column(name: str) -> str:
+        return '"' + name.replace('"', '""') + '"'
+
+    sample_key = quote_column(config.join_key_sample)
+    feature_key = quote_column(config.join_key_feature)
+
     if include_all_sample_cols:
         select_cols = ["s.*"]
     else:
@@ -60,20 +67,42 @@ def build_join_sql(
         sample_fields.append(config.target_col)
         if sample_cols is None or config.seg_col in sample_cols:
             sample_fields.append(config.seg_col)
-        select_cols = [f"s.{col}" for col in dict.fromkeys(sample_fields)]
+        select_cols = [f"s.{quote_column(col)}" for col in dict.fromkeys(sample_fields)]
     join_sql = []
+    ctes = []
+    if config.prefilter_features and table_vars:
+        ctes.append(
+            f"__dlf_sample_ids AS (\n"
+            f"    SELECT DISTINCT s.{sample_key}\n"
+            f"    FROM {config.sample_table} s\n"
+            f")"
+        )
 
     for i, (table, vars_) in enumerate(table_vars.items()):
         alias = f"f{i}"
-        select_cols.extend([f"{alias}.{var}" for var in vars_])
+        select_cols.extend([f"{alias}.{quote_column(var)}" for var in vars_])
+        join_source = table
+        if config.prefilter_features:
+            required_columns = list(dict.fromkeys([config.join_key_feature, *vars_]))
+            projection = ", ".join(f"{alias}.{quote_column(col)}" for col in required_columns)
+            join_source = f"__dlf_feature_{i}"
+            ctes.append(
+                f"{join_source} AS (\n"
+                f"    SELECT {projection}\n"
+                f"    FROM {table} {alias}\n"
+                f"    INNER JOIN __dlf_sample_ids ids\n"
+                f"        ON {alias}.{feature_key} = ids.{sample_key}\n"
+                f")"
+            )
         join_sql.append(
-            f"join {table} {alias} "
-            f"on s.{config.join_key_sample} = {alias}.{config.join_key_feature}"
+            f"INNER JOIN {join_source} {alias}\n"
+            f"    ON s.{sample_key} = {alias}.{feature_key}"
         )
 
-    return f"""
-select
-    {", ".join(select_cols)}
-from {config.sample_table} s
-{" ".join(join_sql)}
-"""
+    with_sql = "WITH\n" + ",\n".join(ctes) + "\n" if ctes else ""
+    return (
+        with_sql
+        + "SELECT\n    " + ",\n    ".join(select_cols)
+        + f"\nFROM {config.sample_table} s\n"
+        + "\n".join(join_sql) + "\n"
+    )

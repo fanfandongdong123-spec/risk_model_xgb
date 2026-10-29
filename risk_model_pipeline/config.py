@@ -51,6 +51,7 @@ class PipelineConfig:
     output_dir: str = "./data"
     save_selected_data: bool = True
     feature_log_interval: int = 100  # 逐列处理时每完成多少个特征输出一次进度
+    prefilter_features: bool = True  # 先按去重样本键预过滤特征表；False 可切回直接关联
 
     def presto_url(self) -> str:
         password = self.presto_password

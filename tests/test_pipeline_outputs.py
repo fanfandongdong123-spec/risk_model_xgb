@@ -14,7 +14,7 @@ import pandas as pd
 
 
 # The internal download client is only required when reading real Presto data.
-if importlib.util.find_spec("titan") is None:
+if "titan" not in sys.modules and importlib.util.find_spec("titan") is None:
     for name in ("titan", "titan.common", "titan.common.data_download"):
         sys.modules[name] = types.ModuleType(name)
 

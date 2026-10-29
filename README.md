@@ -33,13 +33,16 @@ print("Dev / Val KS:", result.ks_dev, result.ks_val)
 print("Parquet:", result.selected_data_path)
 ```
 
-默认用 `INNER JOIN` 关联特征表，仅保留全部匹配成功的样本；关联键不唯一时可能放大行数。
+默认先生成去重样本键集合，每张特征表只选关联键和所需特征，并用样本键做 `INNER JOIN` 预过滤，再拼回样本。最终仍使用 `INNER JOIN`，仅保留全部匹配成功的样本；关联键不唯一时可能放大行数。
+
+设置 `config.prefilter_features=False` 可切回直接关联，便于对比。CTE 不保证物化或提速；可用 `sql, _, _ = pipeline.build_sql(var_lst)` 和 `print(sql)` 预览SQL，再在集群测试。
 
 ## 常用设置
 
 | 设置 | 默认行为 |
 | --- | --- |
 | 候选变量 | 未指定列表时，读取 `mf_` 前缀特征 |
+| 取数 | `prefilter_features=True`，先按样本键预过滤各特征表 |
 | 变量过滤 | 删除缺失率或单一值占比大于 95% 的变量 |
 | Top N | 初筛模型按 gain 排序，最多取 `top_n_feature=300` 个 |
 | 训练 | `num_boost_round=800`；参数通过 `config.xgb_params` 调整 |

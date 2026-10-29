@@ -174,6 +174,8 @@ class RiskModelPipeline:
         sql = build_join_sql(
             self.config, table_vars, include_all_sample_cols, sample_cols=self.sample_cols
         )
+        mode = "去重样本键预过滤各特征表后关联" if self.config.prefilter_features else "直接关联特征表"
+        _log(f"取数方式: {mode}；实际关联 {len(table_vars)} 张特征表，最终使用 INNER JOIN")
         return sql, lost_vars, table_vars
 
     def load_dataset(
