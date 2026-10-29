@@ -126,6 +126,29 @@ class PrefilterSQLTests(unittest.TestCase):
         self.assertNotIn("WITH", sql)
         self.assertEqual(len(self.query(sql)), 6)
 
+    def test_zero_feature_table_does_not_filter_samples_in_either_mode(self):
+        table_vars = {"unused": [], **self.table_vars}
+        for prefilter in (True, False):
+            with self.subTest(prefilter=prefilter):
+                expected = self.query(self.sql(prefilter=prefilter))
+                sql = build_join_sql(self.config, table_vars, sample_cols=self.sample_cols)
+                self.assertNotIn("unused", sql)
+                self.assert_same(expected, self.query(sql))
+                self.assertEqual(len(self.query(sql)), 3)
+        self.assertEqual(table_vars["unused"], [])
+
+    def test_all_zero_feature_tables_return_sample_without_joins(self):
+        for prefilter in (True, False):
+            with self.subTest(prefilter=prefilter):
+                self.config.prefilter_features = prefilter
+                sql = build_join_sql(
+                    self.config, {"unused": [], "fa": []},
+                    sample_cols=["po_id", "fpd15"],
+                )
+                self.assertNotIn("WITH", sql)
+                self.assertNotIn("JOIN", sql)
+                self.assertEqual(len(self.query(sql)), 6)
+
     def test_load_dataset_executes_generated_prefilter_sql(self):
         pipeline = RiskModelPipeline(self.config)
         pipeline.sample_cols = self.sample_cols

@@ -48,7 +48,9 @@ def build_join_sql(
     include_all_sample_cols: bool = False,
     sample_cols: list[str] | None = None,
 ) -> str:
-    """按所需字段关联特征；默认先用去重样本键预过滤各特征表。"""
+    """仅关联有所选特征的表；默认先用去重样本键预过滤。"""
+    table_vars = {table: vars_ for table, vars_ in table_vars.items() if vars_}
+
     def quote_column(name: str) -> str:
         return '"' + name.replace('"', '""') + '"'
 

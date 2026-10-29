@@ -33,7 +33,7 @@ print("Dev / Val KS:", result.ks_dev, result.ks_val)
 print("Parquet:", result.selected_data_path)
 ```
 
-默认先生成去重样本键集合，每张特征表只选关联键和所需特征，并用样本键做 `INNER JOIN` 预过滤，再拼回样本。最终仍使用 `INNER JOIN`，仅保留全部匹配成功的样本；关联键不唯一时可能放大行数。
+只关联选中特征的表，零特征表直接跳过，不参与样本过滤；预过滤和直接关联模式均如此。默认先生成去重样本键集合，每张参与关联的特征表只选关联键和所需特征，并用样本键做 `INNER JOIN` 预过滤，再拼回样本。最终仍使用 `INNER JOIN`，仅保留在这些表中全部匹配成功的样本；关联键不唯一时可能放大行数。
 
 设置 `config.prefilter_features=False` 可切回直接关联，便于对比。CTE 不保证物化或提速；可用 `sql, _, _ = pipeline.build_sql(var_lst)` 和 `print(sql)` 预览SQL，再在集群测试。
 
