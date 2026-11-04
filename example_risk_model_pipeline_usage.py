@@ -62,6 +62,8 @@ result = pipeline.run()
 # model_data = result.data
 
 # Option 5: train separately; missing seg_v is split using config.split_by_person
+# For a count/continuous target, first select a regression objective:
+# config.xgb_params.update({"objective": "reg:squarederror", "eval_metric": "rmse"})
 # train_result = pipeline.train_model(
 #     df=df_input,
 #     feature_names=["mf_xxx_1", "mf_xxx_2"],
@@ -109,6 +111,15 @@ result = pipeline.run()
 # To override an existing seg_v or customize the split ratio:
 # split_result = pipeline.split_dataset(df_input, train_frac=0.8, random_state=42)
 # result = pipeline.run(df=split_result.data)
+
+# Option 7: full regression pipeline (retains decimals/large target values)
+# config.target_col = "delq_d30_cnt"
+# config.xgb_params.update({"objective": "reg:squarederror", "eval_metric": "rmse"})
+# config.save_selected_data = False
+# pipeline = RiskModelPipeline(config)
+# regression_result = pipeline.run(df=df_input, weight_col="weight", return_data=True)
+# print("Dev metrics:", regression_result.metrics_dev)
+# print("Val metrics:", regression_result.metrics_val)
 
 xgb_model = result.model
 selected_vars = result.selected_vars

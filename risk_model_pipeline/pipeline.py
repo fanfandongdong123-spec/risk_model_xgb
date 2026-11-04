@@ -1,8 +1,9 @@
 import gc
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from importlib.util import find_spec
+from inspect import signature
 from pathlib import Path
 from time import perf_counter
 
@@ -13,7 +14,7 @@ from sqlalchemy import create_engine
 from titan.common.data_download import hdfs_to_local
 
 from .config import PipelineConfig
-from .metrics import calc_ks
+from .metrics import calc_ks, calc_regression_metrics
 from .sql import build_feature_table_mapping, build_join_sql, get_table_columns, group_vars_by_table
 
 
@@ -53,6 +54,9 @@ class PipelineResult:
     lost_vars: list[str]
     data: pd.DataFrame | None = None
     selected_data_path: str | None = None
+    task_type: str = "classification"
+    metrics_dev: dict[str, float] = field(default_factory=dict)
+    metrics_val: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -70,6 +74,9 @@ class ModelTrainingResult:
     evals_result: dict
     feature_names: list[str]
     data: pd.DataFrame
+    task_type: str = "classification"
+    metrics_dev: dict[str, float] = field(default_factory=dict)
+    metrics_val: dict[str, float] = field(default_factory=dict)
 
 
 class RiskModelPipeline:
@@ -103,6 +110,68 @@ class RiskModelPipeline:
         if not verbose:
             return []
         return [_TrainingProgress(stage, rounds, int(verbose))]
+
+    @staticmethod
+    def _is_regression(params: dict) -> bool:
+        objective = params.get("objective", "binary:logistic")
+        if not isinstance(objective, str):
+            raise ValueError("流水线需要明确的字符串 objective 来判断二分类或回归")
+        if objective.startswith("reg:") or objective == "count:poisson":
+            return True
+        if objective.startswith("binary:"):
+            return False
+        raise ValueError(f"暂不支持该 objective: {objective}，请使用二分类或回归目标")
+
+    def _training_params(self, params: dict | None = None) -> dict:
+        resolved = dict(params) if params else dict(self.config.xgb_params)
+        if self._is_regression(resolved):
+            resolved.setdefault("eval_metric", "rmse")
+            resolved["disable_default_eval_metric"] = 0
+        return resolved
+
+    def _target_values(self, values: pd.Series, params: dict) -> np.ndarray:
+        try:
+            numeric = pd.to_numeric(values, errors="raise").to_numpy(dtype=float, na_value=np.nan)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"目标字段 {values.name} 必须是数值") from exc
+        if not np.isfinite(numeric).all():
+            raise ValueError(f"目标字段 {values.name} 包含空值或无穷值，请先处理")
+        if self._is_regression(params):
+            return numeric
+        if not np.isin(numeric, [0, 1]).all():
+            raise ValueError(f"二分类目标 {values.name} 必须是0/1；数值预测请设置回归 objective")
+        return numeric.astype("int8")
+
+    def _evaluation_kwargs(self, params: dict) -> dict:
+        if self._is_regression(params):
+            return {"maximize": False}
+        metric_arg = "custom_metric" if "custom_metric" in signature(xgb.train).parameters else "feval"
+        return {metric_arg: self._xgb_eval_ks, "maximize": True}
+
+    @staticmethod
+    def _predict_best(model: xgb.Booster, data: xgb.DMatrix) -> np.ndarray:
+        if hasattr(model, "best_iteration"):
+            return model.predict(data, iteration_range=(0, model.best_iteration + 1))
+        return model.predict(data)
+
+    def _evaluate_model(self, model, dtrain, dval, y_dev, y_val, params):
+        regression = self._is_regression(params)
+        metric_name = "RMSE / MAE / R²" if regression else "KS"
+        with self._stage(f"预测并计算 Dev/Val {metric_name}"):
+            pred_dev = self._predict_best(model, dtrain)
+            pred_val = self._predict_best(model, dval)
+            if regression:
+                metrics_dev = calc_regression_metrics(y_dev, pred_dev)
+                metrics_val = calc_regression_metrics(y_val, pred_val)
+                ks_dev = ks_val = np.nan
+            else:
+                ks_dev = calc_ks(y_dev, pred_dev)
+                ks_val = calc_ks(y_val, pred_val)
+                metrics_dev, metrics_val = {"ks": ks_dev}, {"ks": ks_val}
+        print("\n==== 模型结果 ====")
+        for split, metrics in (("Dev", metrics_dev), ("Val", metrics_val)):
+            print(split + ": " + ", ".join(f"{key.upper()}={value:.4f}" for key, value in metrics.items()))
+        return ks_dev, ks_val, metrics_dev, metrics_val
 
     def _selected_output_columns(
         self,
@@ -207,6 +276,7 @@ class RiskModelPipeline:
     ) -> PipelineResult:
         run_started = perf_counter()
         _log("开始完整建模流程")
+        train_params = self._training_params()
         if self.config.save_selected_data:
             with self._stage("检查 Parquet 保存依赖"):
                 if find_spec("pyarrow") is None and find_spec("fastparquet") is None:
@@ -238,8 +308,8 @@ class RiskModelPipeline:
         if not dev_mask.any() or not val_mask.any():
             raise ValueError(f"{self.config.seg_col} 必须同时包含 Dev 和 Val 分组")
 
-        y_dev = df.loc[dev_mask, self.config.target_col].to_numpy()
-        y_val = df.loc[val_mask, self.config.target_col].to_numpy()
+        y_dev = self._target_values(df.loc[dev_mask, self.config.target_col], train_params)
+        y_val = self._target_values(df.loc[val_mask, self.config.target_col], train_params)
         train_weight = self._get_train_weight(df, dev_mask, weight_col)
 
         with self._stage(f"构建初筛 DMatrix（{len(y_dev)} 行、{len(var_after_single)} 个特征）"):
@@ -251,7 +321,7 @@ class RiskModelPipeline:
             )
         with self._stage("初筛模型训练"):
             model_tmp = xgb.train(
-                self.config.xgb_params,
+                train_params,
                 dtrain_tmp,
                 num_boost_round=self.config.num_boost_round,
                 callbacks=self._training_callbacks(
@@ -291,7 +361,7 @@ class RiskModelPipeline:
             )
         with self._stage("正式模型训练"):
             model = xgb.train(
-                self.config.xgb_params,
+                train_params,
                 dtrain,
                 num_boost_round=self.config.num_boost_round,
                 evals=[(dtrain, "dev"), (dval, "val")],
@@ -300,15 +370,9 @@ class RiskModelPipeline:
                     "正式模型训练", self.config.num_boost_round, self.config.verbose_eval
                 ),
             )
-        with self._stage("预测并计算 Dev/Val KS"):
-            pred_dev = model.predict(dtrain)
-            pred_val = model.predict(dval)
-            ks_dev = calc_ks(y_dev, pred_dev)
-            ks_val = calc_ks(y_val, pred_val)
-
-        print("\n==== 最终模型结果 ====")
-        print(f"Dev KS: {ks_dev:.4f}")
-        print(f"Val KS: {ks_val:.4f}")
+        ks_dev, ks_val, metrics_dev, metrics_val = self._evaluate_model(
+            model, dtrain, dval, y_dev, y_val, train_params
+        )
 
         result_data = None
         if return_data:
@@ -327,6 +391,9 @@ class RiskModelPipeline:
             lost_vars=lost_vars,
             data=result_data,
             selected_data_path=selected_data_path,
+            task_type="regression" if self._is_regression(train_params) else "classification",
+            metrics_dev=metrics_dev,
+            metrics_val=metrics_val,
         )
 
     def split_dataset(
@@ -440,8 +507,9 @@ class RiskModelPipeline:
                 f"{self.config.dev_value!r} 和 {self.config.val_value!r}"
             )
 
-        y_dev = df.loc[dev_mask, target_col].to_numpy()
-        y_val = df.loc[val_mask, target_col].to_numpy()
+        train_params = self._training_params(params)
+        y_dev = self._target_values(df.loc[dev_mask, target_col], train_params)
+        y_val = self._target_values(df.loc[val_mask, target_col], train_params)
         train_weight = self._get_train_weight(df, dev_mask, weight_col)
 
         with self._stage("构建单独训练 Dev DMatrix"):
@@ -458,7 +526,6 @@ class RiskModelPipeline:
                 feature_names=feature_names,
             )
 
-        train_params = dict(params) if params else dict(self.config.xgb_params)
         rounds = self.config.num_boost_round if num_boost_round is None else num_boost_round
         verbose = self.config.verbose_eval if verbose_eval is None else verbose_eval
         evals_result = {}
@@ -468,20 +535,16 @@ class RiskModelPipeline:
                 dtrain,
                 num_boost_round=rounds,
                 evals=[(dtrain, "dev"), (dval, "val")],
-                feval=self._xgb_eval_ks,
-                maximize=True,
+                **self._evaluation_kwargs(train_params),
                 verbose_eval=verbose,
                 early_stopping_rounds=early_stopping_rounds,
                 evals_result=evals_result,
                 callbacks=self._training_callbacks("单独模型训练", rounds, verbose),
             )
 
-        with self._stage("单独训练预测并计算 KS"):
-            ks_dev = calc_ks(y_dev, model.predict(dtrain))
-            ks_val = calc_ks(y_val, model.predict(dval))
-        print("\n==== 单独训练结果 ====")
-        print(f"Dev KS: {ks_dev:.4f}")
-        print(f"Val KS: {ks_val:.4f}")
+        ks_dev, ks_val, metrics_dev, metrics_val = self._evaluate_model(
+            model, dtrain, dval, y_dev, y_val, train_params
+        )
         if hasattr(model, "best_iteration"):
             print(f"Best iteration: {model.best_iteration + 1}")
 
@@ -493,6 +556,9 @@ class RiskModelPipeline:
             evals_result=evals_result,
             feature_names=feature_names,
             data=df,
+            task_type="regression" if self._is_regression(train_params) else "classification",
+            metrics_dev=metrics_dev,
+            metrics_val=metrics_val,
         )
 
     def _get_train_weight(
@@ -575,7 +641,9 @@ class RiskModelPipeline:
                 self._feature_progress("类型转换", i, len(feature_cols), started)
 
             if self.config.target_col in df.columns:
-                df[self.config.target_col] = df[self.config.target_col].astype("int8")
+                df[self.config.target_col] = self._target_values(
+                    df[self.config.target_col], self.config.xgb_params
+                )
 
         return df
 

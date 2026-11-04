@@ -1,6 +1,6 @@
 # risk_model_xgb
 
-风控二分类 XGBoost 建模工具：关联样本与特征 → 划分 Dev/Val → 过滤变量 → 按 gain 选 Top N → 保存数据 → 训练并输出 KS。全程显示阶段进度与耗时。
+风控二分类与回归 XGBoost 建模工具：关联样本与特征 → 划分 Dev/Val → 过滤变量 → 按 gain 选 Top N → 保存数据 → 训练并输出指标。全程显示阶段进度与耗时。
 
 ## 环境
 
@@ -77,6 +77,20 @@ result = pipeline.run(var_lst=var_lst, df=df_input, weight_col="weight")
 # 单独训练，不执行 Top N 筛选和自动保存
 train_result = pipeline.train_model(df=df_input, feature_names=var_in)
 ```
+
+## 回归模型
+
+按 `objective` 自动识别任务。默认二分类；回归标签保留数值精度，输出 RMSE、MAE、R²，`ks_dev/ks_val` 为 NaN：
+
+```python
+config.target_col = "delq_d30_cnt"
+config.xgb_params.update({"objective": "reg:squarederror", "eval_metric": "rmse"})
+pipeline = RiskModelPipeline(config)
+result = pipeline.run(df=df_input, weight_col="weight")
+print(result.metrics_dev, result.metrics_val)
+```
+
+`run()` 按 `num_boost_round` 固定轮数完成初筛及正式训练。需要验证集早停时，使用 `train_model()`；回归按验证集内置指标最小化早停，不计算 KS，返回指标按最佳轮数预测。二分类仍按 KS 最大化早停。目标字段须为有限数值，二分类须为 0/1。
 
 ## 独立计算 PSI / IV
 
