@@ -78,4 +78,21 @@ result = pipeline.run(var_lst=var_lst, df=df_input, weight_col="weight")
 train_result = pipeline.train_model(df=df_input, feature_names=var_in)
 ```
 
-完整调用见 [示例脚本](example_risk_model_pipeline_usage.py)。本地小样本测试：`python -m unittest discover -s tests -v`。
+## 独立计算 PSI / IV
+
+[psi_iv_xgb.py](psi_iv_xgb.py) 不依赖 Pysam，按模型切分阈值输出每个变量、每个分组的 PSI / IV：
+
+```python
+from psi_iv_xgb import calc_psi_iv_by_group
+
+result = calc_psi_iv_by_group(
+    df=df_psi, xgb_mod=model, target="y_payamt",
+    group_var="t0_date", date_base="2025-01",
+)
+psi_table = result.pivot(index="Variable", columns="t0_date", values="PSI")
+iv_table = result.pivot(index="Variable", columns="t0_date", values="IV")
+```
+
+`date_base` 必须与实际分组值一致，日粒度需传具体日期。模型阈值和数据按 `float32` 处理，区间左闭右开，缺失值单独一箱；沿用本地 Pysam 的 `EPS=1e-30` 和 WOE 截断 `[-3, 3]`。标签须为 0/1，缺失标签只排除出 IV；单一类别组的 IV 返回 NaN。设置 `return_detail=True` 返回 `(result, bin_detail)`。支持数值树分裂，暂不支持原生类别分裂。
+
+完整流水线调用见 [示例脚本](example_risk_model_pipeline_usage.py)。本地小样本测试：`python -m unittest discover -s tests -v`。可设置 `PYSAM_SOURCE_ROOT` 为本地 Pysam 源码根目录，额外运行源码对照测试。
